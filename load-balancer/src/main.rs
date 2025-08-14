@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-fn deserialize_uris<'de, D>(deserializer: D) -> Result<Vec<Authority>, D::Error>
+fn deserialize_addresses<'de, D>(deserializer: D) -> Result<Vec<Authority>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -33,7 +33,7 @@ where
 #[derive(Debug, Deserialize)]
 struct AppConfig {
     listen_address: SocketAddr,
-    #[serde(deserialize_with = "deserialize_uris")]
+    #[serde(deserialize_with = "deserialize_addresses")]
     upstream_addresses: Vec<Authority>,
     upstream_timeout_ms: u64,
     circuit_breaker_failure_threshold: u32,
@@ -61,7 +61,12 @@ impl AppConfig {
     fn load() -> Result<Self> {
         Config::builder()
             .add_source(config::File::with_name("settings").required(false))
-            .add_source(config::Environment::with_prefix("LB"))
+            .add_source(
+                config::Environment::with_prefix("LB")
+                    .list_separator(",")
+                    .with_list_parse_key("upstream_addresses")
+                    .try_parsing(true),
+            )
             .build()
             .context("Failed to build configuration.")?
             .try_deserialize()
@@ -245,10 +250,7 @@ async fn handle_request(
     match load_balancer.forward_request(request).await {
         Ok(response) => {
             let (parts, body) = response.into_parts();
-            Ok(Response::from_parts(
-                parts,
-                Full::new(body.collect().await?.to_bytes()),
-            ))
+            Ok(Response::from_parts(parts, body))
         }
         Err(ForwardError::UpstreamError) => Ok(Response::builder()
             .status(StatusCode::BAD_GATEWAY)

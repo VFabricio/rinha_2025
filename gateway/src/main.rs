@@ -1,3 +1,263 @@
-fn main() {
-    println!("Gateway starting...");
+use anyhow::{Context, Result};
+use config::Config;
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Serialize};
+use shared::{Database, Payment, Queue};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
+
+#[derive(Debug, Deserialize)]
+struct GatewayConfig {
+    listen_address: SocketAddr,
+    valkey_url: String,
+    valkey_queue_name: String,
+    result_directory: String,
+}
+
+impl GatewayConfig {
+    fn load() -> Result<Self> {
+        Config::builder()
+            .add_source(config::File::with_name("settings").required(false))
+            .add_source(config::Environment::with_prefix("GATEWAY"))
+            .build()
+            .context("Failed to build configuration.")?
+            .try_deserialize()
+            .context(
+                "Failed to deserialize configuration - check that all required fields are set.",
+            )
+    }
+}
+
+struct Gateway {
+    queue: tokio::sync::Mutex<Queue>,
+    database: Database,
+}
+
+impl Gateway {
+    async fn new(config: GatewayConfig) -> Result<Self> {
+        let queue = Queue::new(&config.valkey_url, &config.valkey_queue_name).await?;
+        let database = Database::new(&config.result_directory)?;
+        Ok(Self {
+            queue: tokio::sync::Mutex::new(queue),
+            database,
+        })
+    }
+
+    async fn handle_payments(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        let (_parts, body) = req.into_parts();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let body_bytes = body.collect().await?.to_bytes();
+
+        match self.process_payment(&body_bytes, timestamp).await {
+            Ok(_) => Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from_static(b"{\"status\": \"queued\"}")))
+                .expect("Failed to build response")),
+            Err(e) => {
+                eprintln!("Payment processing error: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from_static(
+                        b"{\"error\": \"processing failed\"}",
+                    )))
+                    .expect("Failed to build error response"))
+            }
+        }
+    }
+
+    async fn process_payment(&self, body_bytes: &[u8], timestamp: u64) -> Result<()> {
+        let json: serde_json::Value =
+            serde_json::from_slice(body_bytes).context("Failed to parse JSON")?;
+
+        let correlation_id = json["correlationId"]
+            .as_str()
+            .context("Missing correlationId field")?;
+
+        let amount_cents = if let Some(amount_f64) = json["amount"].as_f64() {
+            (amount_f64 * 100.0).round() as u64
+        } else if let Some(amount_u64) = json["amount"].as_u64() {
+            amount_u64 * 100
+        } else {
+            return Err(anyhow::anyhow!("Missing or invalid amount field"));
+        };
+
+        if correlation_id.len() > 255 {
+            return Err(anyhow::anyhow!("Correlation ID too long"));
+        }
+
+        let payment = Payment {
+            correlation_id: correlation_id.to_string(),
+            amount_cents,
+            timestamp,
+        };
+
+        let mut queue = self.queue.lock().await;
+        queue
+            .put_payment(&payment)
+            .await
+            .context("Failed to queue payment")?;
+
+        Ok(())
+    }
+
+    async fn handle_payment_summary(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        let uri = req.uri();
+        let query = uri.query().unwrap_or("");
+
+        let from_timestamp = parse_timestamp_param(query, "from").unwrap_or(0);
+        let to_timestamp = parse_timestamp_param(query, "to").unwrap_or(u64::MAX);
+
+        match self.database.read_all() {
+            Ok(results) => {
+                let summary = aggregate_results(&results, from_timestamp, to_timestamp);
+                let json = serde_json::to_string(&summary).unwrap();
+
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(json)))
+                    .expect("Failed to build response"))
+            }
+            Err(e) => {
+                eprintln!("Failed to read payment results: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from_static(
+                        b"{\"error\": \"failed to read results\"}",
+                    )))
+                    .expect("Failed to build error response"))
+            }
+        }
+    }
+}
+
+fn parse_timestamp_param(query: &str, param: &str) -> Option<u64> {
+    for part in query.split('&') {
+        if let Some(eq_pos) = part.find('=') {
+            let key = &part[..eq_pos];
+            let value = &part[eq_pos + 1..];
+            if key == param {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+                    return Some(dt.timestamp_millis() as u64);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn aggregate_results(results: &[shared::PaymentResult], from: u64, to: u64) -> PaymentSummary {
+    let mut default_requests = 0;
+    let mut default_amount_cents = 0u64;
+    let mut fallback_requests = 0;
+    let mut fallback_amount_cents = 0u64;
+
+    for result in results {
+        if result.timestamp >= from && result.timestamp <= to {
+            match result.processor {
+                0 => {
+                    default_requests += 1;
+                    default_amount_cents += result.amount_cents;
+                }
+                1 => {
+                    fallback_requests += 1;
+                    fallback_amount_cents += result.amount_cents;
+                }
+                _ => {} // Unknown processor
+            }
+        }
+    }
+
+    PaymentSummary {
+        default: ProcessorSummary {
+            total_requests: default_requests,
+            total_amount: default_amount_cents as f64 / 100.0,
+        },
+        fallback: ProcessorSummary {
+            total_requests: fallback_requests,
+            total_amount: fallback_amount_cents as f64 / 100.0,
+        },
+    }
+}
+
+#[derive(Serialize)]
+struct PaymentSummary {
+    default: ProcessorSummary,
+    fallback: ProcessorSummary,
+}
+
+#[derive(Serialize)]
+struct ProcessorSummary {
+    #[serde(rename = "totalRequests")]
+    total_requests: u64,
+    #[serde(rename = "totalAmount")]
+    total_amount: f64,
+}
+
+async fn handle_request(
+    request: Request<Incoming>,
+    gateway: Arc<Gateway>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    match (request.method(), request.uri().path()) {
+        (&Method::POST, "/payments") => gateway.handle_payments(request).await,
+        (&Method::GET, "/payments-summary") => gateway.handle_payment_summary(request).await,
+        _ => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Full::new(Bytes::from_static(b"Not Found")))
+            .expect("Failed to build 404 response")),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = GatewayConfig::load().context("Configuration loading failed")?;
+    let address = config.listen_address;
+    let gateway = Arc::new(
+        Gateway::new(config)
+            .await
+            .context("Gateway initialization failed")?,
+    );
+
+    let listener = TcpListener::bind(address)
+        .await
+        .with_context(|| format!("Failed to bind to address: {}", address))?;
+
+    println!("Gateway listening on {}", address);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
+        let io = TokioIo::new(stream);
+
+        tokio::task::spawn({
+            let gateway = gateway.clone();
+            async move {
+                let service = service_fn(move |request| handle_request(request, gateway.clone()));
+
+                if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                    eprintln!("Error serving connection: {:?}", err);
+                }
+            }
+        });
+    }
 }

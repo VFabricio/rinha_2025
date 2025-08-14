@@ -1,0 +1,4 @@
+listen_address = "0.0.0.0:9000"
+valkey_url = "redis://0.0.0.0:6379"
+valkey_queue_name = "payments"
+result_directory = "/tmp/results"

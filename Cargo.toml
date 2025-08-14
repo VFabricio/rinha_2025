@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
     "gateway",
-    "load-balancer"
+    "load-balancer",
+    "worker",
+    "shared"
 ]
 
 [workspace.dependencies]

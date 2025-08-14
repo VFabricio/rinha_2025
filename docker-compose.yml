@@ -1,0 +1,125 @@
+services:
+  valkey:
+    image: valkey/valkey:7.2-alpine
+    container_name: valkey
+    command: valkey-server --maxmemory 60M --maxmemory-policy noeviction --save 5 1
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+    networks:
+      - internal-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 150M
+
+  load-balancer:
+    build:
+      context: .
+      dockerfile: load-balancer/Dockerfile
+    container_name: load-balancer
+    ports:
+      - "9999:9999"
+    environment:
+      - LB_LISTEN_ADDRESS=0.0.0.0:9999
+      - LB_UPSTREAM_ADDRESSES=gateway-1:9000,gateway-2:9001
+      - LB_UPSTREAM_TIMEOUT_MS=1000
+      - LB_CIRCUIT_BREAKER_FAILURE_THRESHOLD=3
+      - LB_CIRCUIT_BREAKER_RECOVERY_TIMEOUT_MS=5000
+    networks:
+      - internal-network
+    depends_on:
+      - gateway-1
+      - gateway-2
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 150M
+
+  gateway-1:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: gateway-1
+    environment:
+      - GATEWAY_LISTEN_ADDRESS=0.0.0.0:9000
+      - GATEWAY_VALKEY_URL=redis://valkey:6379
+      - GATEWAY_VALKEY_QUEUE_NAME=payments
+      - GATEWAY_RESULT_DIRECTORY=/data/results
+    volumes:
+      - payment-results:/data/results
+    networks:
+      - internal-network
+    depends_on:
+      - valkey
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 50M
+
+  gateway-2:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: gateway-2
+    environment:
+      - GATEWAY_LISTEN_ADDRESS=0.0.0.0:9001
+      - GATEWAY_VALKEY_URL=redis://valkey:6379
+      - GATEWAY_VALKEY_QUEUE_NAME=payments
+      - GATEWAY_RESULT_DIRECTORY=/data/results
+    volumes:
+      - payment-results:/data/results
+    networks:
+      - internal-network
+    depends_on:
+      - valkey
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 50M
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: worker
+    environment:
+      - WORKER_VALKEY_URL=redis://valkey:6379
+      - WORKER_VALKEY_QUEUE_NAME=payments
+      - WORKER_DEFAULT_PROVIDER_URL=http://payment-processor-default:8080
+      - WORKER_FALLBACK_PROVIDER_URL=http://payment-processor-fallback:8080
+      - WORKER_STRATEGY=greedy
+      - WORKER_WORKER_COUNT=4
+      - WORKER_PROVIDER_TIMEOUT_MS=5000
+      - WORKER_RESULT_DIRECTORY=/data/results
+    volumes:
+      - payment-results:/data/results
+    networks:
+      - internal-network
+      - payment-processor
+    depends_on:
+      - valkey
+    deploy:
+      resources:
+        limits:
+          cpus: '0.8'
+          memory: 50M
+
+networks:
+  internal-network:
+    driver: bridge
+  payment-processor:
+    external: true
+
+volumes:
+  valkey-data:
+  payment-results:

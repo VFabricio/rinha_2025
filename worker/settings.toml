@@ -1,0 +1,8 @@
+valkey_url = "redis://localhost:6379"
+valkey_queue_name = "payments"
+default_provider_url = "http://localhost:8080"
+fallback_provider_url = "http://localhost:8081"
+strategy = "greedy"
+worker_count = 4
+provider_timeout_ms = 5000
+result_directory = "/tmp/results"
