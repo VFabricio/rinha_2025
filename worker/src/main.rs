@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use config::Config;
@@ -97,7 +100,6 @@ impl PaymentWorker {
             fallback_provider_url,
             strategy,
             provider_timeout_ms,
-            result_directory,
             ..
         } = config;
 

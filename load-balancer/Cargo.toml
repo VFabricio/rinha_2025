@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+bytes = "1.10.1"
 config = "0.15"
 http = "1.2"
 http-body-util = "0.1"
@@ -12,4 +13,5 @@ hyper = { version = "1.0", features = ["server", "http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0.14"
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net"] }
+tikv-jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }
+tokio = { version = "1.0", features = ["io-util", "rt-multi-thread", "macros", "net"] }

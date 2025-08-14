@@ -100,9 +100,11 @@ impl Queue {
         Ok(size)
     }
 
-    pub async fn put_payment(&mut self, payment: &Payment) -> Result<(), anyhow::Error> {
+    pub async fn put_payment(&self, payment: &Payment) -> Result<(), anyhow::Error> {
         let binary_payment = payment.serialize();
-        self.connection
+        let mut connection = self.connection.clone();
+
+        connection
             .lpush::<_, _, ()>(&self.queue, binary_payment)
             .await?;
         Ok(())
@@ -117,7 +119,7 @@ pub struct Database {
 impl Database {
     pub fn new(result_directory: &str) -> Result<Self> {
         std::fs::create_dir_all(result_directory).context("Failed to create result directory")?;
-        
+
         Ok(Self {
             result_directory: result_directory.to_string(),
             worker_files: Vec::new(),
@@ -127,7 +129,7 @@ impl Database {
     pub fn create_files(&mut self, worker_count: usize) -> Result<()> {
         self.worker_files.clear();
         self.worker_files.reserve(worker_count);
-        
+
         for worker_id in 0..worker_count {
             let result_file_path = format!("{}/worker_{}.bin", self.result_directory, worker_id);
             let file = std::fs::OpenOptions::new()
@@ -137,19 +139,24 @@ impl Database {
                 .context("Failed to open result file")?;
             self.worker_files.push(Some(file));
         }
-        
+
         Ok(())
     }
 
     pub fn log_payment_result(&self, worker_id: usize, result: &PaymentResult) -> Result<()> {
-        let file = self.worker_files.get(worker_id)
+        let file = self
+            .worker_files
+            .get(worker_id)
             .and_then(|f| f.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("Files not created or invalid worker_id: {}", worker_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Files not created or invalid worker_id: {}", worker_id)
+            })?;
 
         use std::io::Write;
         let mut file_ref = file;
         let bytes = result.serialize();
-        file_ref.write_all(&bytes)
+        file_ref
+            .write_all(&bytes)
             .context("Failed to write payment result")?;
         file_ref.flush().context("Failed to flush payment result")?;
         Ok(())
@@ -157,42 +164,41 @@ impl Database {
 
     pub fn read_all(&self) -> Result<Vec<PaymentResult>> {
         let mut results = Vec::new();
-        
-        let entries = std::fs::read_dir(&self.result_directory)
-            .context("Failed to read result directory")?;
-            
+
+        let entries =
+            std::fs::read_dir(&self.result_directory).context("Failed to read result directory")?;
+
         for entry in entries {
             let entry = entry.context("Failed to read directory entry")?;
             let file_name = entry.file_name();
-            
+
             if let Some(name) = file_name.to_str() {
                 if name.starts_with("worker_") && name.ends_with(".bin") {
                     let file_path = entry.path();
-                    
+
                     if let Ok(data) = std::fs::read(&file_path) {
                         let mut offset = 0;
                         while offset + 17 <= data.len() {
-                            let timestamp = u64::from_be_bytes(
-                                data[offset..offset + 8].try_into().unwrap()
-                            );
+                            let timestamp =
+                                u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap());
                             let amount_cents = u64::from_be_bytes(
-                                data[offset + 8..offset + 16].try_into().unwrap()
+                                data[offset + 8..offset + 16].try_into().unwrap(),
                             );
                             let processor = data[offset + 16];
-                            
+
                             results.push(PaymentResult {
                                 timestamp,
                                 amount_cents,
                                 processor,
                             });
-                            
+
                             offset += 17;
                         }
                     }
                 }
             }
         }
-        
+
         Ok(results)
     }
 }

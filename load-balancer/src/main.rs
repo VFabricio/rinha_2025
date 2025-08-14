@@ -1,7 +1,10 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use config::Config;
 use http::uri::Authority;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -94,19 +97,23 @@ enum ForwardError {
 
 impl LoadBalancer {
     fn new(config: AppConfig) -> Result<Self> {
-        let connector = HttpConnector::new();
+        let mut connector = HttpConnector::new();
+        connector.set_keepalive(Some(Duration::from_secs(60)));
+        connector.set_nodelay(true);
+
         let http_client = Client::builder(hyper_util::rt::TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(1000)
+            .pool_timer(hyper_util::rt::TokioTimer::new())
             .build(connector);
+
+        let upstream_states = (0..config.upstream_addresses.len())
+            .map(|_| CircuitState::new())
+            .collect();
 
         let AppConfig {
             upstream_addresses, ..
         } = config;
-
-        let upstream_states = (0..upstream_addresses.len())
-            .map(|_| CircuitState::new())
-            .collect();
 
         Ok(LoadBalancer {
             http_client,
@@ -246,23 +253,27 @@ impl LoadBalancer {
 async fn handle_request(
     request: Request<Incoming>,
     load_balancer: Arc<LoadBalancer>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<Either<Incoming, Full<Bytes>>>, hyper::Error> {
     match load_balancer.forward_request(request).await {
         Ok(response) => {
             let (parts, body) = response.into_parts();
-            Ok(Response::from_parts(parts, body))
+            Ok(Response::from_parts(parts, Either::Left(body)))
         }
         Err(ForwardError::UpstreamError) => Ok(Response::builder()
             .status(StatusCode::BAD_GATEWAY)
-            .body(Full::new(Bytes::from_static(b"Bad Gateway")))
+            .body(Either::Right(Full::new(Bytes::from_static(b"Bad Gateway"))))
             .expect("Failed to build error response.")),
         Err(ForwardError::Timeout) => Ok(Response::builder()
             .status(StatusCode::GATEWAY_TIMEOUT)
-            .body(Full::new(Bytes::from_static(b"Gateway Timeout")))
+            .body(Either::Right(Full::new(Bytes::from_static(
+                b"Gateway Timeout",
+            ))))
             .expect("Failed to build error response.")),
         Err(ForwardError::NoHealthyUpstreams) => Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Full::new(Bytes::from_static(b"Service Unavailable")))
+            .body(Either::Right(Full::new(Bytes::from_static(
+                b"Service Unavailable",
+            ))))
             .expect("Failed to build error response.")),
     }
 }
@@ -290,7 +301,12 @@ async fn main() -> Result<()> {
                 let service =
                     service_fn(move |request| handle_request(request, load_balancer.clone()));
 
-                if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                if let Err(err) = http1::Builder::new()
+                    .keep_alive(true)
+                    .max_buf_size(8192)
+                    .serve_connection(io, service)
+                    .await
+                {
                     eprintln!("Error serving connection: {:?}", err);
                 }
             }

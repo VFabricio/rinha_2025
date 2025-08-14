@@ -1,6 +1,6 @@
 FROM rust:1.82-alpine AS builder
 
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev gcc make
 
 WORKDIR /app
 COPY Cargo.toml ./
