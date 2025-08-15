@@ -84,10 +84,12 @@ services:
       - WORKER_VALKEY_QUEUE_NAME=payments
       - WORKER_DEFAULT_PROVIDER_URL=http://payment-processor-default:8080
       - WORKER_FALLBACK_PROVIDER_URL=http://payment-processor-fallback:8080
-      - WORKER_STRATEGY=greedy
+      - WORKER_STRATEGY=quick
       - WORKER_WORKER_COUNT=4
       - WORKER_PROVIDER_TIMEOUT_MS=5000
       - WORKER_RESULT_DIRECTORY=/data/results
+      - WORKER_HEALTH_CHECK_INTERVAL_MS=5500
+      - WORKER_FAILURE_SLEEP_MS=100
     volumes:
       - payment-results:/data/results
     networks:
