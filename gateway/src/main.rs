@@ -63,6 +63,7 @@ impl Gateway {
         match (request.method(), request.uri().path()) {
             (&Method::POST, "/payments") => self.handle_payments(request).await,
             (&Method::GET, "/payments-summary") => self.handle_payment_summary(request).await,
+            (&Method::POST, "/admin/purge-payments") => self.handle_purge_payments().await,
             _ => Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from_static(b"Not Found")))
@@ -152,6 +153,29 @@ impl Gateway {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from_static(
                         b"{\"error\": \"failed to read results\"}",
+                    )))
+                    .expect("Failed to build error response"))
+            }
+        }
+    }
+
+    async fn handle_purge_payments(&self) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        match self.database.purge_all() {
+            Ok(count) => {
+                let response_body = format!("{{\"purged\": {}}}", count);
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(response_body)))
+                    .expect("Failed to build response"))
+            }
+            Err(e) => {
+                eprintln!("Failed to purge payments: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from_static(
+                        b"{\"error\": \"failed to purge payments\"}",
                     )))
                     .expect("Failed to build error response"))
             }

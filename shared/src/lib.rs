@@ -201,4 +201,26 @@ impl Database {
 
         Ok(results)
     }
+
+    pub fn purge_all(&self) -> Result<usize> {
+        let entries =
+            std::fs::read_dir(&self.result_directory).context("Failed to read result directory")?;
+
+        let mut count = 0;
+        for entry in entries {
+            let entry = entry.context("Failed to read directory entry")?;
+            let file_name = entry.file_name();
+
+            if let Some(name) = file_name.to_str() {
+                if name.starts_with("worker_") && name.ends_with(".bin") {
+                    let file_path = entry.path();
+                    std::fs::write(&file_path, b"")
+                        .with_context(|| format!("Failed to truncate file: {:?}", file_path))?;
+                    count += 1;
+                }
+            }
+        }
+
+        Ok(count)
+    }
 }
