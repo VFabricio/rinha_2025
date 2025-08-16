@@ -762,9 +762,11 @@ dependencies = [
  "hyper",
  "hyper-util",
  "serde",
+ "shared",
  "thiserror",
  "tikv-jemallocator",
  "tokio",
+ "tokio-splice",
 ]
 
 [[package]]
@@ -1077,6 +1079,7 @@ dependencies = [
  "redis",
  "serde",
  "tokio",
+ "tokio-splice",
 ]
 
 [[package]]
@@ -1231,6 +1234,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-splice"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a2a7f772e1e410eed5ec3aa665bc24532d01adb17d67aff6715db3f14e8c758"
+dependencies = [
+ "libc",
+ "tokio",
 ]
 
 [[package]]

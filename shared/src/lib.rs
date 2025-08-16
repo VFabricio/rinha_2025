@@ -1,7 +1,206 @@
 use anyhow::{Context, Result};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
-use std::fs::File;
-use std::io::Write;
+use std::{
+    fs::File,
+    net::SocketAddr,
+    os::fd::{AsRawFd, RawFd},
+    pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Poll,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, Interest, ReadBuf},
+    net::TcpStream,
+    sync::RwLock,
+    task::JoinSet,
+};
+use tokio_splice::Stream;
+
+#[derive(Eq, PartialEq)]
+pub enum ConnectionStatus {
+    Available,
+    Busy,
+    Failed,
+}
+
+pub struct Connection {
+    status: ConnectionStatus,
+    stream: TcpStream,
+}
+
+impl Connection {
+    pub fn new(stream: TcpStream) -> Self {
+        Self {
+            status: ConnectionStatus::Available,
+            stream,
+        }
+    }
+
+    pub fn set_available(&mut self) {
+        self.status = ConnectionStatus::Available;
+    }
+
+    pub fn set_busy(&mut self) {
+        self.status = ConnectionStatus::Busy;
+    }
+
+    pub fn set_failed(&mut self) {
+        self.status = ConnectionStatus::Failed;
+    }
+}
+
+impl AsyncRead for Connection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let stream = Pin::new(&mut self.stream);
+        match stream.poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => {
+                self.set_failed();
+                Poll::Ready(Err(e))
+            }
+        }
+    }
+}
+
+impl AsyncWrite for Connection {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        let stream = Pin::new(&mut self.stream);
+        match stream.poll_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => {
+                self.set_failed();
+                Poll::Ready(Err(e))
+            }
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        let stream = Pin::new(&mut self.stream);
+        match stream.poll_shutdown(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => {
+                self.set_failed();
+                Poll::Ready(Err(e))
+            }
+        }
+    }
+
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        let stream = Pin::new(&mut self.stream);
+        match stream.poll_write(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
+            Poll::Ready(Err(e)) => {
+                self.set_failed();
+                Poll::Ready(Err(e))
+            }
+        }
+    }
+}
+
+impl AsRawFd for Connection {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+}
+
+impl Stream for Connection {
+    fn poll_read_ready_n(&self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        self.stream.poll_read_ready(cx)
+    }
+
+    fn poll_write_ready_n(&self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        self.stream.poll_write_ready(cx)
+    }
+
+    fn try_io_n<R>(
+        &self,
+        interest: Interest,
+        f: impl FnOnce() -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        self.stream.try_io(interest, f)
+    }
+}
+
+pub struct ConnectionPool {
+    address: SocketAddr,
+    connections: Vec<RwLock<Connection>>,
+    current: AtomicUsize,
+}
+
+impl ConnectionPool {
+    pub async fn new(address: SocketAddr, size: usize) -> Result<Self> {
+        let mut join_set = JoinSet::new();
+
+        for _ in 0..size {
+            join_set.spawn(async move { TcpStream::connect(address).await });
+        }
+
+        let results = join_set.join_all().await;
+
+        let mut streams = vec![];
+        for result in results {
+            streams.push(result?);
+        }
+
+        let connections: Vec<_> = streams
+            .into_iter()
+            .map(|c| RwLock::new(Connection::new(c)))
+            .collect();
+
+        Ok(Self {
+            address,
+            connections,
+            current: AtomicUsize::new(0),
+        })
+    }
+
+    fn advance(&self) {
+        let current = self.current.load(Ordering::Acquire);
+        self.current
+            .store((current + 1) % self.connections.len(), Ordering::Release);
+    }
+
+    pub fn try_get_connection(&self) -> Option<&RwLock<Connection>> {
+        let mut tried = 0;
+        let total_connections = self.connections.len();
+
+        while tried < total_connections {
+            let current = self.current.load(Ordering::Acquire);
+            self.advance();
+            let connection = &self.connections[current];
+
+            if let Ok(mut c) = connection.try_write() {
+                if c.status == ConnectionStatus::Available {
+                    c.set_busy();
+                    return Some(connection);
+                } else {
+                    tried += 1;
+                }
+            } else {
+                tried += 1;
+            }
+        }
+        None
+    }
+}
 
 #[derive(Debug)]
 pub struct Payment {

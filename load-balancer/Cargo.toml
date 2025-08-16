@@ -12,6 +12,8 @@ http-body-util = "0.1"
 hyper = { version = "1.0", features = ["server", "http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 serde = { version = "1.0", features = ["derive"] }
+shared = { path = "../shared" }
 thiserror = "2.0.14"
 tikv-jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }
 tokio = { version = "1.0", features = ["io-util", "rt-multi-thread", "macros", "net"] }
+tokio-splice = "0.2.1"
