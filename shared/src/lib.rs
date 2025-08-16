@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use redis::{aio::MultiplexedConnection, AsyncCommands};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     os::fd::{AsRawFd, RawFd},
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::Poll,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, Interest, ReadBuf},
@@ -210,59 +211,38 @@ impl ConnectionPool {
         }
         None
     }
+
+    pub async fn await_for_connection(&self) -> &RwLock<Connection> {
+        loop {
+            if let Some(connection) = self.try_get_connection() {
+                return connection;
+            } else {
+                tokio::time::sleep(Duration::from_micros(10)).await;
+            }
+        }
+    }
+
+    pub async fn await_for_connection_with_timeout(
+        &self,
+        duration: Duration,
+    ) -> Option<&RwLock<Connection>> {
+        tokio::time::timeout(duration, self.await_for_connection())
+            .await
+            .ok()
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Payment {
+    #[serde(rename = "correlationId")]
     pub correlation_id: String,
-    pub amount_cents: u64,
-    pub timestamp: u64,
+    pub amount: f64,
+    pub timestamp: Option<i64>,
 }
 
-impl Payment {
-    pub fn parse(data: &[u8]) -> Result<Self, anyhow::Error> {
-        if data.is_empty() {
-            return Err(anyhow::anyhow!("Empty payment data"));
-        }
-
-        let id_len = data[0] as usize;
-        if data.len() < 1 + id_len + 8 + 8 {
-            return Err(anyhow::anyhow!("Invalid payment data length"));
-        }
-
-        let correlation_id = String::from_utf8(data[1..1 + id_len].to_vec())
-            .context("Invalid UTF-8 in correlation ID")?;
-
-        let amount_bytes: [u8; 8] = data[1 + id_len..1 + id_len + 8]
-            .try_into()
-            .context("Invalid amount data")?;
-        let amount_cents = u64::from_be_bytes(amount_bytes);
-
-        let timestamp_bytes: [u8; 8] = data[1 + id_len + 8..1 + id_len + 16]
-            .try_into()
-            .context("Invalid timestamp data")?;
-        let timestamp = u64::from_be_bytes(timestamp_bytes);
-
-        Ok(Payment {
-            correlation_id,
-            amount_cents,
-            timestamp,
-        })
-    }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut binary_payment = Vec::with_capacity(1 + self.correlation_id.len() + 8 + 8);
-        binary_payment.push(self.correlation_id.len() as u8);
-        binary_payment.extend_from_slice(self.correlation_id.as_bytes());
-        binary_payment.extend_from_slice(&self.amount_cents.to_be_bytes());
-        binary_payment.extend_from_slice(&self.timestamp.to_be_bytes());
-        binary_payment
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PaymentResult {
-    pub timestamp: u64,
+    pub timestamp: i64,
     pub amount_cents: u64,
     pub processor: u8,
 }
@@ -274,49 +254,6 @@ impl PaymentResult {
         result[8..16].copy_from_slice(&self.amount_cents.to_be_bytes());
         result[16] = self.processor;
         result
-    }
-}
-
-pub struct Queue {
-    connection: MultiplexedConnection,
-    queue: String,
-}
-
-impl Queue {
-    pub async fn new(url: &str, queue: &str) -> Result<Self, anyhow::Error> {
-        let client = redis::Client::open(url).context("Failed to create Redis client")?;
-        let connection = client
-            .get_multiplexed_async_connection()
-            .await
-            .context("Failed to connect to Redis.")?;
-        Ok(Self {
-            connection,
-            queue: queue.to_owned(),
-        })
-    }
-
-    pub async fn get_payment(&mut self) -> Result<Payment, anyhow::Error> {
-        let (_, data) = self
-            .connection
-            .brpop::<_, (String, Vec<u8>)>(&self.queue, 1.0)
-            .await?;
-        let payment = Payment::parse(&data)?;
-        Ok(payment)
-    }
-
-    pub async fn get_queue_size(&mut self) -> Result<usize, anyhow::Error> {
-        let size = self.connection.llen::<_, usize>(&self.queue).await?;
-        Ok(size)
-    }
-
-    pub async fn put_payment(&self, payment: &Payment) -> Result<(), anyhow::Error> {
-        let binary_payment = payment.serialize();
-        let mut connection = self.connection.clone();
-
-        connection
-            .lpush::<_, _, ()>(&self.queue, binary_payment)
-            .await?;
-        Ok(())
     }
 }
 
@@ -389,7 +326,7 @@ impl Database {
                         let mut offset = 0;
                         while offset + 17 <= data.len() {
                             let timestamp =
-                                u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap());
+                                i64::from_be_bytes(data[offset..offset + 8].try_into().unwrap());
                             let amount_cents = u64::from_be_bytes(
                                 data[offset + 8..offset + 16].try_into().unwrap(),
                             );

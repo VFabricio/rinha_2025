@@ -24,7 +24,6 @@ impl CommandManager {
             .stream
             .read_u8()
             .await
-            .inspect_err(|e| eprintln!("Discriminator error: {}.", e))
             .context("Error reading discriminator.")?;
         match discriminator {
             0 => {

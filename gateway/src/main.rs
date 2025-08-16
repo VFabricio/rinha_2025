@@ -12,17 +12,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use queue::{Command, QueueClient};
 use serde::{Deserialize, Serialize};
-use shared::{ConnectionPool, Database, Payment};
+use shared::{ConnectionPool, Database};
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-
-#[derive(Deserialize)]
-struct PaymentRequest {
-    #[serde(rename = "correlationId")]
-    correlation_id: String,
-    amount: f64,
-}
 
 #[derive(Debug, Deserialize)]
 struct GatewayConfig {
@@ -89,14 +81,9 @@ impl Gateway {
         req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
         let (_parts, body) = req.into_parts();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
         let body_bytes = body.collect().await?.to_bytes();
 
-        match self.process_payment(&body_bytes, timestamp).await {
+        match self.process_payment(body_bytes).await {
             Ok(_) => Ok(Response::builder()
                 .status(StatusCode::ACCEPTED)
                 .body(Full::new(Bytes::new()))
@@ -114,22 +101,7 @@ impl Gateway {
         }
     }
 
-    async fn process_payment(&self, body_bytes: &[u8], timestamp: u64) -> Result<()> {
-        let request: PaymentRequest =
-            serde_json::from_slice(body_bytes).context("Failed to parse JSON")?;
-
-        if request.correlation_id.len() > 255 {
-            return Err(anyhow::anyhow!("Correlation ID too long"));
-        }
-
-        let amount_cents = (request.amount * 100.0).round() as u64;
-
-        let payment = Payment {
-            correlation_id: request.correlation_id,
-            amount_cents,
-            timestamp,
-        };
-
+    async fn process_payment(&self, body_bytes: Bytes) -> Result<()> {
         let connection = self
             .queue_connection_pool
             .try_get_connection()
@@ -140,7 +112,7 @@ impl Gateway {
         let mut queue_client = QueueClient::new(connection);
 
         queue_client
-            .send_command(Command::Push(payment.serialize()))
+            .send_command(Command::Push(body_bytes.into()))
             .await?;
         connection.set_available();
 
@@ -155,7 +127,7 @@ impl Gateway {
         let query = uri.query().unwrap_or("");
 
         let from_timestamp = parse_timestamp_param(query, "from").unwrap_or(0);
-        let to_timestamp = parse_timestamp_param(query, "to").unwrap_or(u64::MAX);
+        let to_timestamp = parse_timestamp_param(query, "to").unwrap_or(i64::MAX);
 
         match self.database.read_all() {
             Ok(results) => {
@@ -205,14 +177,14 @@ impl Gateway {
     }
 }
 
-fn parse_timestamp_param(query: &str, param: &str) -> Option<u64> {
+fn parse_timestamp_param(query: &str, param: &str) -> Option<i64> {
     for part in query.split('&') {
         if let Some(eq_pos) = part.find('=') {
             let key = &part[..eq_pos];
             let value = &part[eq_pos + 1..];
             if key == param {
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
-                    return Some(dt.timestamp_millis() as u64);
+                    return Some(dt.timestamp_millis());
                 }
             }
         }
@@ -220,7 +192,7 @@ fn parse_timestamp_param(query: &str, param: &str) -> Option<u64> {
     None
 }
 
-fn aggregate_results(results: &[shared::PaymentResult], from: u64, to: u64) -> PaymentSummary {
+fn aggregate_results(results: &[shared::PaymentResult], from: i64, to: i64) -> PaymentSummary {
     let mut default_requests = 0;
     let mut default_amount_cents = 0u64;
     let mut fallback_requests = 0;

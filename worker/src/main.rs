@@ -1,7 +1,8 @@
+#[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::{bail, Context, Result};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use config::Config;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -278,19 +279,25 @@ impl<'a> PaymentWorker<'a> {
                 bail!("Unexpected response from queue.");
             }
             Response::QueueEmpty => Ok(None),
-            Response::Contents(data) => Ok(Some(Payment::parse(&data)?)),
+            Response::Contents(data) => {
+                let mut payment: Payment = serde_json::from_slice(&data)?;
+                if payment.timestamp.is_none() {
+                    let now = Utc::now();
+                    payment.timestamp = Some(now.timestamp_millis());
+                }
+
+                Ok(Some(payment))
+            }
         }
     }
 
     async fn put_payment(&mut self, payment: Payment) -> Result<()> {
-        let bytes = payment.serialize();
+        let bytes = serde_json::to_string(&payment)?.into();
         self.queue_client.send_command(Command::Push(bytes)).await?;
         Ok(())
     }
 
     async fn run(mut self, database: std::sync::Arc<Database>) -> Result<()> {
-        println!("Worker started with {:?} strategy", self.strategy);
-
         loop {
             if matches!(self.strategy, Strategy::Quick) {
                 if self.default_health.is_failing() && self.fallback_health.is_failing() {
@@ -325,22 +332,22 @@ impl<'a> PaymentWorker<'a> {
         };
 
         let requested_at = DateTime::to_rfc3339(
-            &DateTime::from_timestamp_millis(payment.timestamp as i64)
+            &DateTime::from_timestamp_millis(payment.timestamp.unwrap())
                 .context("Invalid timestamp.")?,
         );
 
         let request_body = serde_json::json!({
             "correlationId": payment.correlation_id,
-            "amount": payment.amount_cents as f64 / 100.0,
+            "amount": payment.amount,
             "requestedAt": requested_at,
-        });
+        })
+        .to_string();
 
         let req = Request::post(format!("{}/payments", provider_url))
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(request_body.to_string())))
+            .body(Full::new(Bytes::from(request_body)))
             .context("Failed to build payment request")?;
 
-        let _start_time = Instant::now();
         let response_result = tokio::time::timeout(
             Duration::from_millis(self.provider_timeout_ms),
             self.http_client.request(req),
@@ -385,8 +392,8 @@ impl<'a> PaymentWorker<'a> {
         }
 
         let payment_result = PaymentResult {
-            timestamp: payment.timestamp,
-            amount_cents: payment.amount_cents,
+            timestamp: payment.timestamp.unwrap(),
+            amount_cents: (payment.amount * 100.0).round() as u64,
             processor: processor_id,
         };
 
@@ -440,7 +447,10 @@ async fn main() -> Result<()> {
     let config = WorkerConfig::load().context("Configuration loading failed")?;
     let worker_count = config.worker_count;
 
-    println!("Starting {} payment workers", worker_count);
+    println!(
+        "Starting {} payment workers with {:?} strategy.",
+        worker_count, config.strategy
+    );
 
     let mut database =
         Database::new(&config.result_directory).context("Failed to initialize database")?;

@@ -9,12 +9,13 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     sync::RwLock,
-    task::JoinSet 
+    task::JoinSet,
 };
 use tokio_splice::zero_copy_bidirectional;
 
@@ -26,6 +27,7 @@ struct AppConfig {
     connections_per_upstream: usize,
     listen_address: SocketAddr,
     upstream_addresses: Vec<String>,
+    upstream_connection_timeout_millis: u64,
 }
 
 impl AppConfig {
@@ -71,10 +73,15 @@ impl Upstream {
 struct LoadBalancer {
     upstreams: Vec<Upstream>,
     current: AtomicUsize,
+    timeout: Duration,
 }
 
 impl LoadBalancer {
-    async fn new(addresses: Vec<SocketAddr>, pool_size: usize) -> Result<Self> {
+    async fn new(
+        addresses: Vec<SocketAddr>,
+        pool_size: usize,
+        upstream_connection_timeout: Duration,
+    ) -> Result<Self> {
         let mut join_set = JoinSet::new();
 
         for address in addresses {
@@ -89,6 +96,7 @@ impl LoadBalancer {
         Ok(Self {
             upstreams,
             current: AtomicUsize::new(0),
+            timeout: upstream_connection_timeout,
         })
     }
 
@@ -98,7 +106,7 @@ impl LoadBalancer {
             .store((current + 1) % self.upstreams.len(), Ordering::Release);
     }
 
-    fn get_connection(&self) -> Option<&RwLock<Connection>> {
+    async fn get_connection(&self, timeout: Duration) -> Option<&RwLock<Connection>> {
         let mut failed_upstreams = 0;
         let total_upstreams = self.upstreams.len();
         while failed_upstreams < total_upstreams {
@@ -112,20 +120,31 @@ impl LoadBalancer {
                 failed_upstreams += 1;
                 continue;
             }
-            if let Some(connection) = upstream.pool.try_get_connection() {
+            if let Some(connection) = upstream
+                .pool
+                .await_for_connection_with_timeout(timeout)
+                .await
+            {
                 return Some(connection);
             } else {
                 failed_upstreams += 1;
-                eprintln!("Upstream {} has exhausted its connection pool.", current);
+                eprintln!(
+                    "Upstream {} couldn't return a connection within {}μs.",
+                    current,
+                    timeout.as_micros()
+                );
             }
         }
         None
     }
 
     async fn handle_stream(&self, stream: &mut TcpStream) {
-        if let Some(connection) = self.get_connection() {
+        if let Some(connection) = self.get_connection(self.timeout).await {
             let mut connection = connection.write().await;
-            if let Ok(_) = zero_copy_bidirectional(stream, connection.deref_mut()).await {
+            if zero_copy_bidirectional(stream, connection.deref_mut())
+                .await
+                .is_ok()
+            {
                 connection.set_available();
             } else {
                 connection.set_failed();
@@ -143,6 +162,7 @@ async fn main() -> Result<()> {
         connections_per_upstream,
         listen_address,
         upstream_addresses,
+        upstream_connection_timeout_millis,
     } = AppConfig::load().context("Configuration loading failed")?;
 
     let listener = TcpListener::bind(listen_address).await?;
@@ -159,10 +179,14 @@ async fn main() -> Result<()> {
         resolved_addresses.push(address);
     }
 
-    sleep(Du )
-
-    let load_balancer =
-        Arc::new(LoadBalancer::new(resolved_addresses, connections_per_upstream).await?);
+    let load_balancer = Arc::new(
+        LoadBalancer::new(
+            resolved_addresses,
+            connections_per_upstream,
+            Duration::from_millis(upstream_connection_timeout_millis),
+        )
+        .await?,
+    );
 
     loop {
         let (mut stream, _) = listener.accept().await?;
