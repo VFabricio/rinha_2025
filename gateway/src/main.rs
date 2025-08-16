@@ -3,16 +3,18 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::{Context, Result};
 use config::Config;
+use core::ops::DerefMut;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use queue::{Command, QueueClient};
 use serde::{Deserialize, Serialize};
-use shared::{Database, Payment, Queue};
+use shared::{ConnectionPool, Database, Payment};
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
 #[derive(Deserialize)]
@@ -25,8 +27,8 @@ struct PaymentRequest {
 #[derive(Debug, Deserialize)]
 struct GatewayConfig {
     listen_address: SocketAddr,
-    valkey_url: String,
-    valkey_queue_name: String,
+    queue_url: String,
+    queue_connection_pool_size: usize,
     result_directory: String,
 }
 
@@ -45,15 +47,26 @@ impl GatewayConfig {
 }
 
 struct Gateway {
-    queue: Queue,
+    queue_connection_pool: ConnectionPool,
     database: Database,
 }
 
 impl Gateway {
     async fn new(config: GatewayConfig) -> Result<Self> {
-        let queue = Queue::new(&config.valkey_url, &config.valkey_queue_name).await?;
+        let GatewayConfig {
+            queue_url,
+            queue_connection_pool_size,
+            ..
+        } = config;
+
+        let queue_connection_pool =
+            ConnectionPool::new(queue_url, queue_connection_pool_size).await?;
+
         let database = Database::new(&config.result_directory)?;
-        Ok(Self { queue, database })
+        Ok(Self {
+            queue_connection_pool,
+            database,
+        })
     }
 
     async fn handle_request(
@@ -117,10 +130,19 @@ impl Gateway {
             timestamp,
         };
 
-        self.queue
-            .put_payment(&payment)
-            .await
-            .context("Failed to queue payment")?;
+        let connection = self
+            .queue_connection_pool
+            .try_get_connection()
+            .context("No connection to queue are available.")?;
+        let mut connection = connection.write().await;
+        let connection = connection.deref_mut();
+
+        let mut queue_client = QueueClient::new(connection);
+
+        queue_client
+            .send_command(Command::Push(payment.serialize()))
+            .await?;
+        connection.set_available();
 
         Ok(())
     }
@@ -250,16 +272,17 @@ struct ProcessorSummary {
 async fn main() -> Result<()> {
     let config = GatewayConfig::load().context("Configuration loading failed")?;
     let address = config.listen_address;
-    let gateway = Gateway::new(config)
-        .await
-        .context("Gateway initialization failed")?;
-    let gateway = Box::leak(Box::new(gateway));
 
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("Failed to bind to address: {}", address))?;
 
     println!("Gateway listening on {}", address);
+
+    let gateway = Gateway::new(config)
+        .await
+        .context("Gateway initialization failed")?;
+    let gateway = Box::leak(Box::new(gateway));
 
     loop {
         let (stream, _) = listener.accept().await?;

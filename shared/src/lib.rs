@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use std::{
     fs::File,
-    net::SocketAddr,
     os::fd::{AsRawFd, RawFd},
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
@@ -10,19 +9,20 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, Interest, ReadBuf},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     sync::RwLock,
     task::JoinSet,
 };
 use tokio_splice::Stream;
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum ConnectionStatus {
     Available,
     Busy,
     Failed,
 }
 
+#[derive(Debug)]
 pub struct Connection {
     status: ConnectionStatus,
     stream: TcpStream,
@@ -60,6 +60,7 @@ impl AsyncRead for Connection {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => {
+                eprintln!("Error in poll_read: {}", e);
                 self.set_failed();
                 Poll::Ready(Err(e))
             }
@@ -77,6 +78,7 @@ impl AsyncWrite for Connection {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => {
+                eprintln!("Error in poll_flush: {}", e);
                 self.set_failed();
                 Poll::Ready(Err(e))
             }
@@ -92,6 +94,7 @@ impl AsyncWrite for Connection {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => {
+                eprintln!("Error in poll_shutdown: {}", e);
                 self.set_failed();
                 Poll::Ready(Err(e))
             }
@@ -108,6 +111,7 @@ impl AsyncWrite for Connection {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
             Poll::Ready(Err(e)) => {
+                eprintln!("Error in poll_write: {}", e);
                 self.set_failed();
                 Poll::Ready(Err(e))
             }
@@ -140,16 +144,19 @@ impl Stream for Connection {
 }
 
 pub struct ConnectionPool {
-    address: SocketAddr,
     connections: Vec<RwLock<Connection>>,
     current: AtomicUsize,
 }
 
 impl ConnectionPool {
-    pub async fn new(address: SocketAddr, size: usize) -> Result<Self> {
+    pub async fn new<A>(address: A, size: usize) -> Result<Self>
+    where
+        A: ToSocketAddrs + Send + Clone + 'static,
+    {
         let mut join_set = JoinSet::new();
 
         for _ in 0..size {
+            let address = address.clone();
             join_set.spawn(async move { TcpStream::connect(address).await });
         }
 
@@ -157,7 +164,11 @@ impl ConnectionPool {
 
         let mut streams = vec![];
         for result in results {
-            streams.push(result?);
+            streams.push({
+                let stream = result?;
+                let _ = stream.set_nodelay(true);
+                stream
+            });
         }
 
         let connections: Vec<_> = streams
@@ -166,7 +177,6 @@ impl ConnectionPool {
             .collect();
 
         Ok(Self {
-            address,
             connections,
             current: AtomicUsize::new(0),
         })

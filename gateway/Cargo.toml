@@ -15,6 +15,7 @@ hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 shared = { path = "../shared" }
+queue = { path = "../queue" }
 tikv-jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net"] }
 tokio-util = { version = "0.7", features = ["io"] }

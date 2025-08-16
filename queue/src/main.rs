@@ -1,68 +1,14 @@
 use anyhow::{bail, Context, Result};
 use config::Config;
+use queue::{Command, Response};
 use serde::Deserialize;
+use std::io::ErrorKind;
 use std::sync::Mutex;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-
-pub enum Command {
-    Push(Vec<u8>),
-    Pop,
-}
-
-impl From<Command> for Vec<u8> {
-    fn from(value: Command) -> Self {
-        match value {
-            Command::Push(contents) => {
-                let mut result = Vec::with_capacity(contents.len() + 1);
-                result.push(0u8);
-                result.extend(contents);
-                result
-            }
-            Command::Pop => {
-                vec![1u8]
-            }
-        }
-    }
-}
-
-pub struct QueueClient {
-    stream: TcpStream,
-}
-
-impl QueueClient {
-    pub fn new(stream: TcpStream) -> Self {
-        Self { stream }
-    }
-
-    pub async fn send_command(&mut self, command: Command) -> Result<Response> {
-        let bytes: Vec<u8> = command.into();
-        self.stream.write_all(bytes.as_slice()).await?;
-        let discriminator = self.stream.read_u8().await?;
-        match discriminator {
-            0 => Ok(Response::Accepted),
-            1 => {
-                let size = self.stream.read_u16().await?;
-                let mut bytes = vec![0u8; size as usize];
-                let _ = self.stream.read_exact(bytes.as_mut_slice()).await?;
-                Ok(Response::Contents(bytes))
-            }
-            2 => Ok(Response::QueueEmpty),
-            _ => {
-                bail!("Invalid response received from the queue.");
-            }
-        }
-    }
-}
-
-pub enum Response {
-    Accepted,
-    Contents(Vec<u8>),
-    QueueEmpty,
-}
 
 struct CommandManager {
     stream: TcpStream,
@@ -74,12 +20,25 @@ impl CommandManager {
     }
 
     async fn get_command(&mut self) -> Result<Command> {
-        let discriminator = self.stream.read_u8().await?;
+        let discriminator = self
+            .stream
+            .read_u8()
+            .await
+            .inspect_err(|e| eprintln!("Discriminator error: {}.", e))
+            .context("Error reading discriminator.")?;
         match discriminator {
             0 => {
-                let size = self.stream.read_u16().await?;
+                let size = self
+                    .stream
+                    .read_u16()
+                    .await
+                    .context("Error reading command size.")?;
                 let mut bytes = vec![0u8; size as usize];
-                let _ = self.stream.read_exact(bytes.as_mut_slice()).await?;
+                let _ = self
+                    .stream
+                    .read_exact(bytes.as_mut_slice())
+                    .await
+                    .context("Error reading push contents.")?;
                 Ok(Command::Push(bytes))
             }
             1 => Ok(Command::Pop),
@@ -102,7 +61,7 @@ impl CommandManager {
             Response::Contents(contents) => {
                 self.stream.write_u8(1u8).await?;
                 self.stream.write_u16(contents.len() as u16).await?;
-                self.stream.write(&contents).await?;
+                self.stream.write_all(&contents).await?;
             }
             Response::QueueEmpty => {
                 self.stream.write_u8(2u8).await?;
@@ -178,12 +137,16 @@ impl QueueManager {
 async fn main() -> Result<()> {
     let QueueConfig { listen_address } = QueueConfig::load()?;
 
-    let listener = TcpListener::bind(listen_address).await?;
+    let listener = TcpListener::bind(&listen_address).await?;
+
+    println!("Queue listening on {}.", listen_address);
+
     let queue_manager = Arc::new(QueueManager::new());
 
     loop {
         let queue_manager = queue_manager.clone();
-        let (stream, _) = listener.accept().await?;
+        let (stream, remote) = listener.accept().await?;
+
         let mut command_manager = CommandManager::new(stream);
 
         tokio::spawn(async move {
@@ -194,13 +157,22 @@ async fn main() -> Result<()> {
                             .handle_command(command, &mut command_manager)
                             .await
                         {
-                            eprintln!("Error reading command: {}: ", e);
+                            eprintln!("Error handling command: {}: ", e);
                             let _ = command_manager.shutdown().await;
                             return;
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error reading command: {}: ", e);
+                        let is_eof = e
+                            .downcast_ref::<std::io::Error>()
+                            .map(|e| e.kind() == ErrorKind::UnexpectedEof)
+                            .unwrap_or(false);
+
+                        if is_eof {
+                            eprintln!("Remote {} disconnected.", remote);
+                        } else {
+                            eprintln!("Error reading command: {}: ", e);
+                        }
                         let _ = command_manager.shutdown().await;
                         return;
                     }

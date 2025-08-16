@@ -10,12 +10,12 @@ COPY worker/ ./worker/
 COPY shared/ ./shared/
 COPY queue/ ./queue/
 
-RUN cargo build --release --bin gateway
+RUN cargo build --release --bin queue
 
 FROM alpine:3.18
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /app/target/release/gateway /usr/local/bin/gateway
+COPY --from=builder /app/target/release/queue /usr/local/bin/queue
 
-CMD ["gateway"]
+CMD ["queue"]

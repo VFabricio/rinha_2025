@@ -14,7 +14,7 @@ use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     sync::RwLock,
-    task::JoinSet,
+    task::JoinSet 
 };
 use tokio_splice::zero_copy_bidirectional;
 
@@ -147,6 +147,8 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind(listen_address).await?;
 
+    println!("Load balancer listening on {}.", listen_address);
+
     let mut resolved_addresses = vec![];
 
     for address in upstream_addresses {
@@ -156,6 +158,8 @@ async fn main() -> Result<()> {
             .context("Invalid address.")?;
         resolved_addresses.push(address);
     }
+
+    sleep(Du )
 
     let load_balancer =
         Arc::new(LoadBalancer::new(resolved_addresses, connections_per_upstream).await?);

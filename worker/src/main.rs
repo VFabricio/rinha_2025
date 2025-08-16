@@ -1,19 +1,20 @@
-#[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::DateTime;
 use config::Config;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::Request;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use queue::{Command, QueueClient, Response};
 use serde::Deserialize;
-use shared::{Database, Payment, PaymentResult, Queue};
+use shared::{Database, Payment, PaymentResult};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,8 +37,7 @@ impl FromStr for Strategy {
 
 #[derive(Debug, Clone, Deserialize)]
 struct WorkerConfig {
-    valkey_url: String,
-    valkey_queue_name: String,
+    queue_url: String,
     default_provider_url: String,
     fallback_provider_url: String,
     strategy: Strategy,
@@ -101,10 +101,10 @@ impl ProcessorHealth {
     }
 }
 
-struct PaymentWorker {
+struct PaymentWorker<'a> {
     http_client: Client<HttpConnector, Full<Bytes>>,
     strategy: Strategy,
-    queue: Queue,
+    queue_client: QueueClient<'a, TcpStream>,
     default_provider_url: String,
     fallback_provider_url: String,
     provider_timeout_ms: u64,
@@ -133,8 +133,8 @@ impl HealthChecker {
         check_interval_ms: u64,
         provider_timeout_ms: u64,
     ) -> Self {
-        let http_client = Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(HttpConnector::new());
+        let http_client =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
 
         Self {
             http_client,
@@ -153,10 +153,12 @@ impl HealthChecker {
 
         loop {
             interval.tick().await;
-            
-            let default_check = self.check_processor_health(&self.default_provider_url, &self.default_health);
-            let fallback_check = self.check_processor_health(&self.fallback_provider_url, &self.fallback_health);
-            
+
+            let default_check =
+                self.check_processor_health(&self.default_provider_url, &self.default_health);
+            let fallback_check =
+                self.check_processor_health(&self.fallback_provider_url, &self.fallback_health);
+
             let _ = tokio::join!(default_check, fallback_check);
         }
     }
@@ -170,17 +172,21 @@ impl HealthChecker {
         let response_result = tokio::time::timeout(
             Duration::from_millis(self.provider_timeout_ms),
             self.http_client.request(req),
-        ).await;
+        )
+        .await;
 
         match response_result {
             Ok(Ok(response)) => {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
-                
+
                 if response.status().is_success() {
                     if let Ok(body) = response.into_body().collect().await {
-                        if let Ok(health_response) = serde_json::from_slice::<HealthResponse>(&body.to_bytes()) {
-                            let actual_latency = std::cmp::max(latency_ms, health_response.min_response_time);
-                            
+                        if let Ok(health_response) =
+                            serde_json::from_slice::<HealthResponse>(&body.to_bytes())
+                        {
+                            let actual_latency =
+                                std::cmp::max(latency_ms, health_response.min_response_time);
+
                             if health_response.failing {
                                 health.mark_failing();
                             } else {
@@ -211,6 +217,7 @@ struct HealthResponse {
     min_response_time: u64,
 }
 
+/*
 struct QueueMonitor {
     queue: Queue,
 }
@@ -235,12 +242,13 @@ impl QueueMonitor {
         }
     }
 }
+*/
 
-impl PaymentWorker {
+impl<'a> PaymentWorker<'a> {
     fn new(
         config: &WorkerConfig,
         worker_id: usize,
-        queue: Queue,
+        queue_client: QueueClient<'a, TcpStream>,
         default_health: Arc<ProcessorHealth>,
         fallback_health: Arc<ProcessorHealth>,
     ) -> Self {
@@ -252,7 +260,7 @@ impl PaymentWorker {
         Self {
             http_client,
             strategy: config.strategy,
-            queue,
+            queue_client,
             default_provider_url: config.default_provider_url.clone(),
             fallback_provider_url: config.fallback_provider_url.clone(),
             provider_timeout_ms: config.provider_timeout_ms,
@@ -261,6 +269,23 @@ impl PaymentWorker {
             fallback_health,
             failure_sleep_ms: config.failure_sleep_ms,
         }
+    }
+
+    async fn get_payment(&mut self) -> Result<Option<Payment>> {
+        let response = self.queue_client.send_command(Command::Pop).await?;
+        match response {
+            Response::Accepted => {
+                bail!("Unexpected response from queue.");
+            }
+            Response::QueueEmpty => Ok(None),
+            Response::Contents(data) => Ok(Some(Payment::parse(&data)?)),
+        }
+    }
+
+    async fn put_payment(&mut self, payment: Payment) -> Result<()> {
+        let bytes = payment.serialize();
+        self.queue_client.send_command(Command::Push(bytes)).await?;
+        Ok(())
     }
 
     async fn run(mut self, database: std::sync::Arc<Database>) -> Result<()> {
@@ -274,14 +299,20 @@ impl PaymentWorker {
                 }
             }
 
-            match self.queue.get_payment().await {
-                Ok(payment) => {
+            match self.get_payment().await {
+                Ok(Some(payment)) => {
                     if self.process_payment(&payment, &database).await.is_err() {
-                        let _ = self.queue.put_payment(&payment).await;
+                        if let Err(e) = self.put_payment(payment).await {
+                            eprintln!("Error requeuing payment: {}", e);
+                        }
                     }
                 }
-                Err(_) => {
+                Ok(None) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    eprintln!("Error running worker: {}", e);
+                    return Err(e);
                 }
             }
         }
@@ -341,10 +372,12 @@ impl PaymentWorker {
             Err(_) => {
                 let timeout_latency = self.provider_timeout_ms;
                 if processor_id == 0 {
-                    self.default_health.update_latency_from_timeout(timeout_latency);
+                    self.default_health
+                        .update_latency_from_timeout(timeout_latency);
                     self.default_health.mark_failing();
                 } else {
-                    self.fallback_health.update_latency_from_timeout(timeout_latency);
+                    self.fallback_health
+                        .update_latency_from_timeout(timeout_latency);
                     self.fallback_health.mark_failing();
                 }
                 return Err(anyhow::anyhow!("Provider request timed out"));
@@ -378,9 +411,17 @@ impl PaymentWorker {
                     return (&self.default_provider_url, 0);
                 }
 
-                let default_weight = if default_latency == 0 { 1000 } else { 1000 / default_latency };
-                let fallback_weight = if fallback_latency == 0 { 1000 } else { 1000 / fallback_latency };
-                
+                let default_weight = if default_latency == 0 {
+                    1000
+                } else {
+                    1000 / default_latency
+                };
+                let fallback_weight = if fallback_latency == 0 {
+                    1000
+                } else {
+                    1000 / fallback_latency
+                };
+
                 let total_weight = default_weight + fallback_weight;
                 let random_val = fastrand::u64(0..total_weight);
 
@@ -422,7 +463,7 @@ async fn main() -> Result<()> {
             config.health_check_interval_ms,
             config.provider_timeout_ms,
         );
-        
+
         tasks.push(tokio::spawn(async move {
             if let Err(e) = health_checker.run().await {
                 eprintln!("Health checker failed: {}", e);
@@ -435,13 +476,19 @@ async fn main() -> Result<()> {
         let database = database.clone();
         let default_health = default_health.clone();
         let fallback_health = fallback_health.clone();
-        
+
         tasks.push(tokio::spawn(async move {
-            let queue = Queue::new(&config.valkey_url, &config.valkey_queue_name)
+            let queue_url = config.queue_url.clone();
+            let mut stream = TcpStream::connect(queue_url)
                 .await
-                .expect("Failed to create queue");
-            
-            let worker = PaymentWorker::new(&config, i, queue, default_health, fallback_health);
+                .expect("Could not connect to queue.");
+            let _ = stream.set_nodelay(true);
+
+            let queue_client = QueueClient::new(&mut stream);
+
+            let worker =
+                PaymentWorker::new(&config, i, queue_client, default_health, fallback_health);
+
             println!("Worker {} started", i);
             if let Err(e) = worker.run(database).await {
                 eprintln!("Worker {} failed: {}", i, e);
@@ -449,6 +496,7 @@ async fn main() -> Result<()> {
         }));
     }
 
+    /*
     tasks.push(tokio::spawn(async move {
         let config = config.clone();
         let monitor = QueueMonitor::new(&config.valkey_url, &config.valkey_queue_name)
@@ -458,6 +506,7 @@ async fn main() -> Result<()> {
             eprintln!("Error running queue monitor: {}.", e);
         }
     }));
+    */
 
     let results = futures::future::join_all(tasks).await;
 
