@@ -1,63 +1,31 @@
+use anyhow::{Context, Result};
+use config::Config;
+use core::ops::DerefMut;
+use serde::Deserialize;
+use shared::{Connection, ConnectionPool};
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpStream},
+    sync::RwLock,
+    task::JoinSet,
+};
+use tokio_splice::zero_copy_bidirectional;
+
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use anyhow::{Context, Result};
-use config::Config;
-use http::uri::Authority;
-use http_body_util::{Either, Full};
-use hyper::body::{Bytes, Incoming};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri};
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use hyper_util::rt::TokioIo;
-use serde::Deserialize;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::TcpListener;
-
-fn deserialize_addresses<'de, D>(deserializer: D) -> Result<Vec<Authority>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let items: Vec<String> = Vec::deserialize(deserializer)?;
-    let mut result = Vec::with_capacity(items.len());
-    for item in items {
-        result.push(
-            item.parse()
-                .map_err(|_| serde::de::Error::custom(format!("{item} is not a valid URI.")))?,
-        )
-    }
-    Ok(result)
-}
-
 #[derive(Debug, Deserialize)]
 struct AppConfig {
+    connections_per_upstream: usize,
     listen_address: SocketAddr,
-    #[serde(deserialize_with = "deserialize_addresses")]
-    upstream_addresses: Vec<Authority>,
-    upstream_timeout_ms: u64,
-    circuit_breaker_failure_threshold: u32,
-    circuit_breaker_recovery_timeout_ms: u64,
-}
-
-#[derive(Debug)]
-struct CircuitState {
-    consecutive_failures: AtomicU32,
-    last_failure_time_ms: AtomicU64,
-    is_open: AtomicBool,
-}
-
-impl CircuitState {
-    fn new() -> Self {
-        Self {
-            consecutive_failures: AtomicU32::new(0),
-            last_failure_time_ms: AtomicU64::new(0),
-            is_open: AtomicBool::new(false),
-        }
-    }
+    upstream_addresses: Vec<String>,
 }
 
 impl AppConfig {
@@ -79,237 +47,125 @@ impl AppConfig {
     }
 }
 
-struct LoadBalancer {
-    http_client: Client<HttpConnector, Incoming>,
-    next_upstream_index: AtomicUsize,
-    upstream_states: Vec<CircuitState>,
-    upstream_addresses: Vec<Authority>,
-    upstream_timeout_ms: Duration,
-    recovery_timeout_ms: u64,
-    failure_threshold: u32,
+#[derive(Eq, PartialEq)]
+enum UpstreamState {
+    Healthy,
+    Degraded,
 }
 
-enum ForwardError {
-    NoHealthyUpstreams,
-    Timeout,
-    UpstreamError,
+struct Upstream {
+    pool: ConnectionPool,
+    state: UpstreamState,
+}
+
+impl Upstream {
+    async fn new(address: SocketAddr, pool_size: usize) -> Result<Self> {
+        let pool = ConnectionPool::new(address, pool_size).await?;
+        Ok(Self {
+            pool,
+            state: UpstreamState::Healthy,
+        })
+    }
+}
+
+struct LoadBalancer {
+    upstreams: Vec<Upstream>,
+    current: AtomicUsize,
 }
 
 impl LoadBalancer {
-    fn new(config: AppConfig) -> Result<Self> {
-        let mut connector = HttpConnector::new();
-        connector.set_keepalive(Some(Duration::from_secs(60)));
-        connector.set_nodelay(true);
+    async fn new(addresses: Vec<SocketAddr>, pool_size: usize) -> Result<Self> {
+        let mut join_set = JoinSet::new();
 
-        let http_client = Client::builder(hyper_util::rt::TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(1000)
-            .pool_timer(hyper_util::rt::TokioTimer::new())
-            .build(connector);
+        for address in addresses {
+            join_set.spawn(async move { Upstream::new(address, pool_size).await });
+        }
 
-        let upstream_states = (0..config.upstream_addresses.len())
-            .map(|_| CircuitState::new())
-            .collect();
+        let mut upstreams = vec![];
+        for upstream in join_set.join_all().await {
+            upstreams.push(upstream?);
+        }
 
-        let AppConfig {
-            upstream_addresses, ..
-        } = config;
-
-        Ok(LoadBalancer {
-            http_client,
-            next_upstream_index: AtomicUsize::new(0),
-            upstream_states,
-            upstream_addresses,
-            upstream_timeout_ms: Duration::from_millis(config.upstream_timeout_ms),
-            recovery_timeout_ms: config.circuit_breaker_recovery_timeout_ms,
-            failure_threshold: config.circuit_breaker_failure_threshold,
+        Ok(Self {
+            upstreams,
+            current: AtomicUsize::new(0),
         })
     }
 
-    fn get_next_upstream_index(&self) -> usize {
-        self.next_upstream_index.fetch_add(1, Ordering::Relaxed) % self.upstream_addresses.len()
+    fn advance(&self) {
+        let current = self.current.load(Ordering::Acquire);
+        self.current
+            .store((current + 1) % self.upstreams.len(), Ordering::Release);
     }
 
-    fn is_upstream_healthy(&self, index: usize) -> bool {
-        let state = &self.upstream_states[index];
-
-        if !state.is_open.load(Ordering::Acquire) {
-            return true;
-        }
-
-        let last_failure = state.last_failure_time_ms.load(Ordering::Relaxed);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
-        if now.saturating_sub(last_failure) >= self.recovery_timeout_ms
-            && state
-                .is_open
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            state.consecutive_failures.store(0, Ordering::Relaxed);
-            return true;
-        }
-        false
-    }
-
-    fn find_next_available_upstream_index(&self) -> Option<usize> {
+    fn get_connection(&self) -> Option<&RwLock<Connection>> {
         let mut failed_upstreams = 0;
+        let total_upstreams = self.upstreams.len();
+        while failed_upstreams < total_upstreams {
+            let current = self.current.load(Ordering::Acquire);
+            {
+                self.advance();
+            }
+            let upstream = &self.upstreams[current];
 
-        loop {
-            let index = self.get_next_upstream_index();
-            if self.is_upstream_healthy(index) {
-                return Some(index);
-            } else if failed_upstreams < self.upstream_addresses.len() {
+            if upstream.state == UpstreamState::Degraded {
                 failed_upstreams += 1;
                 continue;
+            }
+            if let Some(connection) = upstream.pool.try_get_connection() {
+                return Some(connection);
             } else {
-                return None;
+                failed_upstreams += 1;
+                eprintln!("Upstream {} has exhausted its connection pool.", current);
             }
         }
+        None
     }
 
-    fn mark_upstream_success(&self, index: usize) {
-        let state = &self.upstream_states[index];
-        state.consecutive_failures.store(0, Ordering::Relaxed);
-        state.is_open.store(false, Ordering::Release);
-    }
-
-    fn mark_upstream_failure(&self, index: usize) {
-        let state = &self.upstream_states[index];
-
-        let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
-
-        if failures + 1 >= self.failure_threshold {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            state.last_failure_time_ms.store(now, Ordering::Relaxed);
-            state.is_open.store(true, Ordering::Release);
-        }
-    }
-
-    async fn forward_request(
-        &self,
-        request: Request<Incoming>,
-    ) -> Result<Response<Incoming>, ForwardError> {
-        let upstream_index = self
-            .find_next_available_upstream_index()
-            .ok_or(ForwardError::NoHealthyUpstreams)?;
-
-        let upstream_address = self
-            .upstream_addresses
-            .get(upstream_index)
-            .expect("Tried to get an upstream address with an index out of bounds.");
-
-        let uri = Uri::builder()
-            .scheme("http")
-            .authority(upstream_address.clone())
-            .path_and_query(
-                request
-                    .uri()
-                    .path_and_query()
-                    .cloned()
-                    .unwrap_or_else(|| "/".parse().unwrap()),
-            )
-            .build()
-            .expect("Failed to build URI for forwarded request.");
-
-        let (mut parts, body) = request.into_parts();
-        parts.uri = uri;
-
-        let upstream_request = Request::from_parts(parts, body);
-
-        let response_or_timeout = tokio::time::timeout(
-            self.upstream_timeout_ms,
-            self.http_client.request(upstream_request),
-        )
-        .await;
-
-        match response_or_timeout {
-            Ok(Ok(response)) => {
-                if response.status().is_success() {
-                    self.mark_upstream_success(upstream_index);
-                } else {
-                    self.mark_upstream_failure(upstream_index);
-                }
-                Ok(response)
+    async fn handle_stream(&self, stream: &mut TcpStream) {
+        if let Some(connection) = self.get_connection() {
+            let mut connection = connection.write().await;
+            if let Ok(_) = zero_copy_bidirectional(stream, connection.deref_mut()).await {
+                connection.set_available();
+            } else {
+                connection.set_failed();
             }
-            Ok(Err(_)) => {
-                self.mark_upstream_failure(upstream_index);
-                Err(ForwardError::UpstreamError)
-            }
-            Err(_) => {
-                self.mark_upstream_failure(upstream_index);
-                Err(ForwardError::Timeout)
-            }
+        } else {
+            eprintln!("Cannot handle connection because all upstream are degraded.");
+            let _ = stream.shutdown().await;
         }
-    }
-}
-
-async fn handle_request(
-    request: Request<Incoming>,
-    load_balancer: Arc<LoadBalancer>,
-) -> Result<Response<Either<Incoming, Full<Bytes>>>, hyper::Error> {
-    match load_balancer.forward_request(request).await {
-        Ok(response) => {
-            let (parts, body) = response.into_parts();
-            Ok(Response::from_parts(parts, Either::Left(body)))
-        }
-        Err(ForwardError::UpstreamError) => Ok(Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Either::Right(Full::new(Bytes::from_static(b"Bad Gateway"))))
-            .expect("Failed to build error response.")),
-        Err(ForwardError::Timeout) => Ok(Response::builder()
-            .status(StatusCode::GATEWAY_TIMEOUT)
-            .body(Either::Right(Full::new(Bytes::from_static(
-                b"Gateway Timeout",
-            ))))
-            .expect("Failed to build error response.")),
-        Err(ForwardError::NoHealthyUpstreams) => Ok(Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Either::Right(Full::new(Bytes::from_static(
-                b"Service Unavailable",
-            ))))
-            .expect("Failed to build error response.")),
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = AppConfig::load().context("Configuration loading failed")?;
-    let address = config.listen_address;
-    let load_balancer =
-        Arc::new(LoadBalancer::new(config).context("Load balancer initialization failed")?);
-    let listener = TcpListener::bind(address)
-        .await
-        .with_context(|| format!("Failed to bind to address: {}", address))?;
+    let AppConfig {
+        connections_per_upstream,
+        listen_address,
+        upstream_addresses,
+    } = AppConfig::load().context("Configuration loading failed")?;
 
-    println!("Load balancer listening on {}", address);
+    let listener = TcpListener::bind(listen_address).await?;
+
+    let mut resolved_addresses = vec![];
+
+    for address in upstream_addresses {
+        let address = address
+            .to_socket_addrs()?
+            .next()
+            .context("Invalid address.")?;
+        resolved_addresses.push(address);
+    }
+
+    let load_balancer =
+        Arc::new(LoadBalancer::new(resolved_addresses, connections_per_upstream).await?);
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
-        let io = TokioIo::new(stream);
+        let (mut stream, _) = listener.accept().await?;
+        let load_balancer = load_balancer.clone();
 
-        tokio::task::spawn({
-            let load_balancer = load_balancer.clone();
-            async move {
-                let service =
-                    service_fn(move |request| handle_request(request, load_balancer.clone()));
-
-                if let Err(err) = http1::Builder::new()
-                    .keep_alive(true)
-                    .max_buf_size(8192)
-                    .serve_connection(io, service)
-                    .await
-                {
-                    eprintln!("Error serving connection: {:?}", err);
-                }
-            }
+        tokio::spawn(async move {
+            load_balancer.handle_stream(&mut stream).await;
         });
     }
 }

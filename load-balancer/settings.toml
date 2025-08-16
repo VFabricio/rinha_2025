@@ -1,5 +1,3 @@
 listen_address = "0.0.0.0:9999"
 upstream_addresses = ["localhost:9000", "localhost:9001"]
-upstream_timeout_ms = 1000
-circuit_breaker_failure_threshold = 3
-circuit_breaker_recovery_timeout_ms = 5000
+connections_per_upstream = 200
