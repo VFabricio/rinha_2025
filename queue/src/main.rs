@@ -2,12 +2,17 @@ use anyhow::{bail, Context, Result};
 use config::Config;
 use queue::{Command, Response};
 use serde::Deserialize;
-use std::io::ErrorKind;
-use std::sync::Mutex;
+use std::io::{ErrorKind, SeekFrom};
+use std::sync::RwLock;
+use std::time::Duration;
 use std::{collections::VecDeque, sync::Arc};
+use tokio::io::{AsyncSeekExt, BufStream};
+use tokio::time::sleep;
 use tokio::{
+    fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    sync::Mutex,
 };
 
 struct CommandManager {
@@ -35,7 +40,7 @@ impl CommandManager {
                 let mut bytes = vec![0u8; size as usize];
                 let _ = self
                     .stream
-                    .read_exact(bytes.as_mut_slice())
+                    .read_exact(&mut bytes)
                     .await
                     .context("Error reading push contents.")?;
                 Ok(Command::Push(bytes))
@@ -74,6 +79,7 @@ impl CommandManager {
 #[derive(Deserialize)]
 struct QueueConfig {
     listen_address: String,
+    snapshot_frequency_seconds: u64,
 }
 
 impl QueueConfig {
@@ -91,13 +97,13 @@ impl QueueConfig {
 }
 
 struct QueueManager {
-    contents: Mutex<VecDeque<Vec<u8>>>,
+    contents: RwLock<VecDeque<Vec<u8>>>,
 }
 
 impl QueueManager {
-    fn new() -> Self {
+    fn new(initial_state: VecDeque<Vec<u8>>) -> Self {
         Self {
-            contents: Mutex::new(VecDeque::new()),
+            contents: RwLock::new(initial_state),
         }
     }
 
@@ -108,17 +114,17 @@ impl QueueManager {
 
                 let mut contents = self
                     .contents
-                    .lock()
+                    .write()
                     .expect("Failed to lock queue contents.");
-                contents.push_front(bytes);
+                contents.push_back(bytes);
             }
             Command::Pop => {
                 let result = {
                     let mut contents = self
                         .contents
-                        .lock()
+                        .write()
                         .expect("Failed to lock queue contents.");
-                    contents.pop_back()
+                    contents.pop_front()
                 };
                 if let Some(bytes) = result {
                     reader.send_response(Response::Contents(bytes)).await?;
@@ -130,11 +136,72 @@ impl QueueManager {
 
         Ok(())
     }
+
+    async fn dump(&self) -> VecDeque<Vec<u8>> {
+        let contents = self
+            .contents
+            .read()
+            .expect("Failed to lock queue contents for reading.");
+        contents.clone()
+    }
+}
+
+static DATA_FILE: &str = "data.bin";
+
+struct PersistenceManager {
+    file: Mutex<BufStream<File>>,
+}
+
+impl PersistenceManager {
+    async fn new() -> Result<Self> {
+        let file = Mutex::new(BufStream::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(DATA_FILE)
+                .await?,
+        ));
+        Ok(Self { file })
+    }
+
+    async fn read_all(&self) -> Result<VecDeque<Vec<u8>>> {
+        let mut result = VecDeque::new();
+        let mut file = self.file.lock().await;
+        loop {
+            let size = match file.read_u16().await {
+                Ok(s) => s,
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            };
+            let mut bytes = vec![0u8; size as usize];
+            file.read_exact(&mut bytes).await?;
+            result.push_back(bytes);
+        }
+        Ok(result)
+    }
+
+    async fn write_all(&self, data: VecDeque<Vec<u8>>) -> Result<()> {
+        let mut file = self.file.lock().await;
+        file.seek(SeekFrom::Start(0)).await?;
+        for bytes in &data {
+            file.write_u16(bytes.len() as u16).await?;
+            file.write_all(bytes).await?;
+        }
+        let position = file.stream_position().await?;
+        file.flush().await?;
+        file.get_ref().set_len(position).await?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let QueueConfig { listen_address } = QueueConfig::load()?;
+    let QueueConfig {
+        listen_address,
+        snapshot_frequency_seconds,
+    } = QueueConfig::load()?;
 
     if std::path::Path::new(&listen_address).exists() {
         std::fs::remove_file(&listen_address)?;
@@ -144,7 +211,22 @@ async fn main() -> Result<()> {
 
     println!("Queue listening on {}.", listen_address);
 
-    let queue_manager = Arc::new(QueueManager::new());
+    let persistence_manager = PersistenceManager::new().await?;
+    let contents = persistence_manager.read_all().await?;
+
+    let queue_manager = Arc::new(QueueManager::new(contents));
+    let snapshotting_queue_manager = queue_manager.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let contents = snapshotting_queue_manager.dump().await;
+            println!("Snapshotting queue contents: {} items.", contents.len());
+            if let Err(e) = persistence_manager.write_all(contents).await {
+                eprint!("Error saving queue snapshot: {}.", e)
+            };
+            sleep(Duration::from_secs(snapshot_frequency_seconds)).await;
+        }
+    });
 
     loop {
         let queue_manager = queue_manager.clone();

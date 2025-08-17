@@ -95,6 +95,7 @@ services:
     container_name: queue
     environment:
       - QUEUE_LISTEN_ADDRESS=/tmp/sockets/queue
+      - QUEUE_SNAPSHOT_FREQUENCY_SECONDS=5
     volumes:
       - queue-data:/data
       - sockets:/tmp/sockets

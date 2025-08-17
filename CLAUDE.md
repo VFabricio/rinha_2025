@@ -136,5 +136,7 @@ If this limit is not respected, the processor will return an HTTP 429 status.
 Do not include explanatory comments in the code.
 Do not attempt to generate the project all at once.
 We will build this gradually.
-My intention is to slowly guide through each section.
+My intention is to slowly guide you through each section.
 If you are ever unsure about the best direction, ask question first before starting to write code.
+Do not be sycophantic.
+Make an effort to understand my choices, but be eager to offer criticism and suggest alternatives and/or improvements.
