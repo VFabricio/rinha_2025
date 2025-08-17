@@ -13,12 +13,11 @@ use hyper_util::rt::TokioIo;
 use queue::{Command, QueueClient};
 use serde::{Deserialize, Serialize};
 use shared::{ConnectionPool, Database};
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use tokio::net::UnixListener;
 
 #[derive(Debug, Deserialize)]
 struct GatewayConfig {
-    listen_address: SocketAddr,
+    listen_address: String,
     queue_url: String,
     queue_connection_pool_size: usize,
     result_directory: String,
@@ -243,10 +242,14 @@ struct ProcessorSummary {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = GatewayConfig::load().context("Configuration loading failed")?;
-    let address = config.listen_address;
+    let address = &*config.listen_address;
 
-    let listener = TcpListener::bind(address)
-        .await
+    if std::path::Path::new(address).exists() {
+        std::fs::remove_file(address)
+            .context("Failed to remove existing socket file")?;
+    }
+
+    let listener = UnixListener::bind(address)
         .with_context(|| format!("Failed to bind to address: {}", address))?;
 
     println!("Gateway listening on {}", address);
@@ -258,7 +261,6 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
         let io = TokioIo::new(stream);
 
         tokio::task::spawn({

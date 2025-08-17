@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
+use tokio::net::UnixStream;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,7 +105,7 @@ impl ProcessorHealth {
 struct PaymentWorker<'a> {
     http_client: Client<HttpConnector, Full<Bytes>>,
     strategy: Strategy,
-    queue_client: QueueClient<'a, TcpStream>,
+    queue_client: QueueClient<'a, UnixStream>,
     default_provider_url: String,
     fallback_provider_url: String,
     provider_timeout_ms: u64,
@@ -249,7 +249,7 @@ impl<'a> PaymentWorker<'a> {
     fn new(
         config: &WorkerConfig,
         worker_id: usize,
-        queue_client: QueueClient<'a, TcpStream>,
+        queue_client: QueueClient<'a, UnixStream>,
         default_health: Arc<ProcessorHealth>,
         fallback_health: Arc<ProcessorHealth>,
     ) -> Self {
@@ -489,10 +489,9 @@ async fn main() -> Result<()> {
 
         tasks.push(tokio::spawn(async move {
             let queue_url = config.queue_url.clone();
-            let mut stream = TcpStream::connect(queue_url)
+            let mut stream = UnixStream::connect(queue_url)
                 .await
                 .expect("Could not connect to queue.");
-            let _ = stream.set_nodelay(true);
 
             let queue_client = QueueClient::new(&mut stream);
 

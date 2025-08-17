@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     os::fd::{AsRawFd, RawFd},
+    path::Path,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::Poll,
@@ -10,7 +11,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, Interest, ReadBuf},
-    net::{TcpStream, ToSocketAddrs},
+    net::UnixStream,
     sync::RwLock,
     task::JoinSet,
 };
@@ -26,11 +27,11 @@ pub enum ConnectionStatus {
 #[derive(Debug)]
 pub struct Connection {
     status: ConnectionStatus,
-    stream: TcpStream,
+    stream: UnixStream,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: UnixStream) -> Self {
         Self {
             status: ConnectionStatus::Available,
             stream,
@@ -150,26 +151,22 @@ pub struct ConnectionPool {
 }
 
 impl ConnectionPool {
-    pub async fn new<A>(address: A, size: usize) -> Result<Self>
+    pub async fn new<A>(path: A, size: usize) -> Result<Self>
     where
-        A: ToSocketAddrs + Send + Clone + 'static,
+        A: AsRef<Path> + 'static,
     {
         let mut join_set = JoinSet::new();
 
         for _ in 0..size {
-            let address = address.clone();
-            join_set.spawn(async move { TcpStream::connect(address).await });
+            let path = path.as_ref().to_owned();
+            join_set.spawn(async { UnixStream::connect(path).await });
         }
 
         let results = join_set.join_all().await;
 
         let mut streams = vec![];
         for result in results {
-            streams.push({
-                let stream = result?;
-                let _ = stream.set_nodelay(true);
-                stream
-            });
+            streams.push(result?);
         }
 
         let connections: Vec<_> = streams

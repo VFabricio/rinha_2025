@@ -4,7 +4,7 @@ use core::ops::DerefMut;
 use serde::Deserialize;
 use shared::{Connection, ConnectionPool};
 use std::{
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -61,7 +61,7 @@ struct Upstream {
 }
 
 impl Upstream {
-    async fn new(address: SocketAddr, pool_size: usize) -> Result<Self> {
+    async fn new(address: String, pool_size: usize) -> Result<Self> {
         let pool = ConnectionPool::new(address, pool_size).await?;
         Ok(Self {
             pool,
@@ -78,7 +78,7 @@ struct LoadBalancer {
 
 impl LoadBalancer {
     async fn new(
-        addresses: Vec<SocketAddr>,
+        addresses: Vec<String>,
         pool_size: usize,
         upstream_connection_timeout: Duration,
     ) -> Result<Self> {
@@ -169,19 +169,9 @@ async fn main() -> Result<()> {
 
     println!("Load balancer listening on {}.", listen_address);
 
-    let mut resolved_addresses = vec![];
-
-    for address in upstream_addresses {
-        let address = address
-            .to_socket_addrs()?
-            .next()
-            .context("Invalid address.")?;
-        resolved_addresses.push(address);
-    }
-
     let load_balancer = Arc::new(
         LoadBalancer::new(
-            resolved_addresses,
+            upstream_addresses,
             connections_per_upstream,
             Duration::from_millis(upstream_connection_timeout_millis),
         )

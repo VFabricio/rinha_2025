@@ -7,15 +7,15 @@ use std::sync::Mutex;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{UnixListener, UnixStream},
 };
 
 struct CommandManager {
-    stream: TcpStream,
+    stream: UnixStream,
 }
 
 impl CommandManager {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: UnixStream) -> Self {
         Self { stream }
     }
 
@@ -136,7 +136,11 @@ impl QueueManager {
 async fn main() -> Result<()> {
     let QueueConfig { listen_address } = QueueConfig::load()?;
 
-    let listener = TcpListener::bind(&listen_address).await?;
+    if std::path::Path::new(&listen_address).exists() {
+        std::fs::remove_file(&listen_address)?;
+    }
+
+    let listener = UnixListener::bind(&listen_address)?;
 
     println!("Queue listening on {}.", listen_address);
 
@@ -168,7 +172,7 @@ async fn main() -> Result<()> {
                             .unwrap_or(false);
 
                         if is_eof {
-                            eprintln!("Remote {} disconnected.", remote);
+                            eprintln!("Remote {:?} disconnected.", remote);
                         } else {
                             eprintln!("Error reading command: {}: ", e);
                         }
